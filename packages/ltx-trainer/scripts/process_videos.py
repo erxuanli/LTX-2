@@ -46,6 +46,12 @@ from ltx_trainer.model_loader import load_audio_vae_encoder, load_video_vae_enco
 from ltx_trainer.utils import open_image_as_srgb
 from ltx_trainer.video_utils import get_video_frame_count, read_video
 
+try:
+    import OpenImageIO as oiio 
+    HAS_OIIO = True 
+except ImportError:
+    HAS_OIIO = False 
+
 disable_progress_bar()
 
 # Register HEIF/HEIC support
@@ -61,6 +67,83 @@ AUDIO_FREQUENCY_BINS = 16
 
 DEFAULT_TILE_SIZE = 512  # Spatial tile size in pixels (must be ≥64 and divisible by 32)
 DEFAULT_TILE_OVERLAP = 128  # Spatial tile overlap in pixels (must be divisible by 32)
+
+def _is_exr_sequence_dir(path: Path) -> bool:
+    """Return True if path is a directory containing .exr files."""
+    return path.is_dir() and any(path.glob("*.exr"))
+
+
+def _load_exr_sequence(path: Path, max_frames: int | None = None) -> tuple[torch.Tensor, float]:
+    """
+    Load a directory of sequentially-named EXR files as a video tensor using OpenImageIO.
+
+    Args:
+        path: Directory containing .exr files named such that lexicographic sort = frame order
+        max_frames: Maximum number of frames to load
+
+    Returns:
+        Tuple of (tensor [F, C, H, W] float32 in [0, 1], fps)
+        fps is read from fps.txt in the directory if present, otherwise defaults to 24.0
+    """
+    if not HAS_OIIO:
+        raise ImportError(
+            "EXR support requires OpenImageIO: pip install openimageio"
+        )
+
+    exr_files = sorted(path.glob("*.exr"))
+    if not exr_files:
+        raise ValueError(f"No .exr files found in {path}")
+
+    if max_frames is not None:
+        exr_files = exr_files[:max_frames]
+
+    # Optional fps sidecar file
+    fps = 24.0
+    fps_file = path / "fps.txt"
+    if fps_file.exists():
+        try:
+            fps = float(fps_file.read_text().strip())
+        except ValueError:
+            logger.warning(f"Could not parse fps.txt in {path}, defaulting to {fps}")
+
+    frames = []
+
+    for exr_path in exr_files:
+        inp = oiio.ImageInput.open(str(exr_path))
+        if inp is None:
+            raise ValueError(
+                f"OpenImageIO could not open {exr_path}: {oiio.geterror()}"
+            )
+
+        spec = inp.spec()
+        pixels = inp.read_image(oiio.FLOAT)  # [H, W, nchannels] float32
+        inp.close()
+
+        if pixels is None:
+            raise ValueError(f"Failed to read pixel data from {exr_path}")
+
+        channel_names = [spec.channelnames[i] for i in range(spec.nchannels)]
+
+        try:
+            r_idx = channel_names.index("R")
+            g_idx = channel_names.index("G")
+            b_idx = channel_names.index("B")
+        except ValueError:
+            raise ValueError(
+                f"{exr_path} is missing R, G, or B channels. "
+                f"Available channels: {channel_names}"
+            )
+
+        frame = pixels[:, :, [r_idx, g_idx, b_idx]]  # [H, W, 3]
+
+        # Linear light -> display-referred via gamma 2.2
+        frame = np.clip(frame, 0.0, None)
+        frame = np.clip(frame ** (1.0 / 2.2), 0.0, 1.0).astype(np.float32)
+
+        # [H, W, C] -> [C, H, W]
+        frames.append(torch.from_numpy(frame).permute(2, 0, 1))
+
+    return torch.stack(frames, dim=0), fps  # [F, C, H, W]
 
 app = typer.Typer(
     pretty_exceptions_enable=False,
@@ -144,7 +227,10 @@ class MediaDataset(Dataset):
         if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
             media_tensor = self._preprocess_image(video_path)
             fps = 1.0
-            audio_data = None  # Images don't have audio
+            audio_data = None
+        elif _is_exr_sequence_dir(video_path):
+            media_tensor, fps = self._preprocess_exr_sequence(video_path)
+            audio_data = None  # EXR sequences never have audio
         else:
             media_tensor, fps = self._preprocess_video(video_path)
 
@@ -227,7 +313,7 @@ class MediaDataset(Dataset):
         video_paths = [data_root / Path(line.strip()) for line in df[column].tolist()]
 
         # Validate that all paths exist
-        invalid_paths = [path for path in video_paths if not path.is_file()]
+        invalid_paths = [path for path in video_paths if not path.is_file() and not _is_exr_sequence_dir(path)]
         if invalid_paths:
             raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
 
@@ -249,7 +335,7 @@ class MediaDataset(Dataset):
             video_paths.append(data_root / Path(entry[column].strip()))
 
         # Validate that all paths exist
-        invalid_paths = [path for path in video_paths if not path.is_file()]
+        invalid_paths = [path for path in video_paths if not path.is_file() and not _is_exr_sequence_dir(path)]
         if invalid_paths:
             raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
 
@@ -267,7 +353,7 @@ class MediaDataset(Dataset):
                 video_paths.append(data_root / Path(entry[column].strip()))
 
         # Validate that all paths exist
-        invalid_paths = [path for path in video_paths if not path.is_file()]
+        invalid_paths = [path for path in video_paths if not path.is_file() and not _is_exr_sequence_dir(path)]
         if invalid_paths:
             raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
 
@@ -287,7 +373,10 @@ class MediaDataset(Dataset):
                 continue
 
             try:
-                frame_count = get_video_frame_count(video_path)
+                if _is_exr_sequence_dir(video_path):
+                    frame_count = len(list(video_path.glob("*.exr")))
+                else:
+                    frame_count = get_video_frame_count(video_path)
 
                 if frame_count >= min_frames_required:
                     valid_video_paths.append(video_path)
@@ -349,6 +438,24 @@ class MediaDataset(Dataset):
 
         # Permute [F,C,H,W] -> [C,F,H,W] for VAE compatibility
         # After DataLoader batching, this becomes [B,C,F,H,W] which VAE expects
+        video = video.permute(1, 0, 2, 3).contiguous()
+
+        return video, fps
+
+    def _preprocess_exr_sequence(self, path: Path) -> tuple[torch.Tensor, float]:
+        """Preprocess an EXR frame sequence using the same pipeline as regular video."""
+        video, fps = _load_exr_sequence(path, max_frames=self.max_target_frames)
+        # video is [F, C, H, W] — same shape as what read_video returns
+
+        nearest_bucket = self._get_resolution_bucket_for_item(video)
+        target_num_frames, target_height, target_width = nearest_bucket
+        frames_resized = self._resize_and_crop(video, target_height, target_width)
+
+        # Trim to bucket frame count (never pads)
+        frames_resized = frames_resized[:target_num_frames]
+
+        # Normalise and reorder to [C, F, H, W] for the VAE
+        video = torch.stack([self.transforms(frame) for frame in frames_resized], dim=0)
         video = video.permute(1, 0, 2, 3).contiguous()
 
         return video, fps
