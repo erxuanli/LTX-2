@@ -39,3 +39,6 @@ tmp
 *.png
 *.wav
 *.webp
+
+# models folder
+models/
