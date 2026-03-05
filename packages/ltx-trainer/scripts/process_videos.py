@@ -15,7 +15,7 @@ Can be used as a standalone script:
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -68,18 +68,108 @@ AUDIO_FREQUENCY_BINS = 16
 DEFAULT_TILE_SIZE = 512  # Spatial tile size in pixels (must be ≥64 and divisible by 32)
 DEFAULT_TILE_OVERLAP = 128  # Spatial tile overlap in pixels (must be divisible by 32)
 
+# HDR encoding options for EXR sequences
+# "gamma22"          - gamma 2.2 tone-map (SDR output, discards HDR information)
+# "log2"             - log2 encoding: maps (0, log2_max_val] -> [0, 1], recommended for HDR training
+# "pq"               - ST 2084 (PQ) EOTF inverse, maps [0, peak_luminance] nits -> [0, 1]
+# "hlg"              - Hybrid Log-Gamma OETF, maps [0, peak_luminance] -> [0, 1]
+# "linear_normalized" - divide by log2_max_val, clips highlights
+HdrEncoding = Literal["gamma22", "log2", "pq", "hlg", "linear_normalized"]
+
+DEFAULT_HDR_ENCODING: HdrEncoding = "log2"
+# Maximum scene-linear value for log2/linear_normalized encodings.
+# S2R-HDR uses physically-based rendering; most pixels sit well within [0, 100].
+DEFAULT_LOG2_MAX_VAL: float = 100.0
+
+def _apply_log2_encoding(linear: np.ndarray, max_val: float = DEFAULT_LOG2_MAX_VAL) -> np.ndarray:
+    """Map scene-linear HDR values to [0, 1] via log2 encoding.
+    Formula: log2(x + 1) / log2(max_val + 1)
+    Suitable for scene-linear EXR data where highlights can reach ~100x SDR white.
+    """
+    log_max = np.log2(max_val + 1.0)
+    return np.clip(np.log2(np.maximum(linear, 0.0) + 1.0) / log_max, 0.0, 1.0).astype(np.float32)
+
+
+def _apply_pq(linear: np.ndarray, peak_luminance: float = 10000.0) -> np.ndarray:
+    """Apply ST 2084 (PQ) OETF: maps scene-linear [0, peak_luminance] nits -> [0, 1].
+    Industry standard for HDR10 / Dolby Vision content.
+    For scene-referred EXR, treat 1.0 = 100 nits (peak_luminance=10000 → 100x headroom).
+    """
+    Y = np.clip(linear, 0.0, None) / peak_luminance
+    m1: float = 2610.0 / 4096.0 / 4.0
+    m2: float = 2523.0 / 4096.0 * 128.0
+    c1: float = 3424.0 / 4096.0
+    c2: float = 2413.0 / 4096.0 * 32.0
+    c3: float = 2392.0 / 4096.0 * 32.0
+    Ym1 = np.power(np.maximum(Y, 0.0), m1)
+    return np.clip(np.power((c1 + c2 * Ym1) / (1.0 + c3 * Ym1), m2), 0.0, 1.0).astype(np.float32)
+
+
+def _apply_hlg(linear: np.ndarray, peak_luminance: float = 1000.0) -> np.ndarray:
+    """Apply HLG (Hybrid Log-Gamma) OETF: maps scene-linear [0, peak_luminance] -> [0, 1].
+    Defined in ITU-R BT.2100. Backward-compatible with SDR in the toe region.
+    """
+    a: float = 0.17883277
+    b: float = 0.28466892
+    c: float = 0.55991073
+    E = np.clip(linear, 0.0, None) / peak_luminance
+    out = np.where(
+        E <= 1.0 / 12.0,
+        np.sqrt(np.maximum(3.0 * E, 0.0)),
+        a * np.log(np.maximum(12.0 * E - b, 1e-9)) + c,
+    )
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def _encode_linear_to_display(
+    linear: np.ndarray,
+    encoding: HdrEncoding,
+    log2_max_val: float = DEFAULT_LOG2_MAX_VAL,
+) -> np.ndarray:
+    """Convert scene-linear HDR pixel values [H, W, 3] to display-referred [0, 1].
+    Args:
+        linear: Scene-linear RGB values (non-negative float32).
+        encoding: Transfer function to apply.
+        log2_max_val: Max scene-linear value for "log2" and "linear_normalized" encodings.
+    Returns:
+        float32 array in [0, 1].
+    """
+    linear = np.clip(linear, 0.0, None)
+    if encoding == "gamma22":
+        return np.clip(linear ** (1.0 / 2.2), 0.0, 1.0).astype(np.float32)
+    elif encoding == "log2":
+        return _apply_log2_encoding(linear, max_val=log2_max_val)
+    elif encoding == "pq":
+        return _apply_pq(linear)
+    elif encoding == "hlg":
+        return _apply_hlg(linear)
+    elif encoding == "linear_normalized":
+        return np.clip(linear / log2_max_val, 0.0, 1.0).astype(np.float32)
+    else:
+        raise ValueError(f"Unknown HDR encoding: {encoding!r}")
+
+
 def _is_exr_sequence_dir(path: Path) -> bool:
     """Return True if path is a directory containing .exr files."""
     return path.is_dir() and any(path.glob("*.exr"))
 
 
-def _load_exr_sequence(path: Path, max_frames: int | None = None) -> tuple[torch.Tensor, float]:
+def _load_exr_sequence(
+    path: Path,
+    max_frames: int | None = None,
+    hdr_encoding: HdrEncoding = DEFAULT_HDR_ENCODING,
+    log2_max_val: float = DEFAULT_LOG2_MAX_VAL,
+) -> tuple[torch.Tensor, float]:
     """
     Load a directory of sequentially-named EXR files as a video tensor using OpenImageIO.
 
     Args:
         path: Directory containing .exr files named such that lexicographic sort = frame order
         max_frames: Maximum number of frames to load
+        hdr_encoding: Transfer function used to map scene-linear values to [0, 1].
+            "gamma22" replicates the legacy SDR behaviour.
+            "log2" is recommended when you want to preserve HDR information.
+        log2_max_val: Max scene-linear value assumed for "log2" and "linear_normalized".
 
     Returns:
         Tuple of (tensor [F, C, H, W] float32 in [0, 1], fps)
@@ -136,9 +226,8 @@ def _load_exr_sequence(path: Path, max_frames: int | None = None) -> tuple[torch
 
         frame = pixels[:, :, [r_idx, g_idx, b_idx]]  # [H, W, 3]
 
-        # Linear light -> display-referred via gamma 2.2
-        frame = np.clip(frame, 0.0, None)
-        frame = np.clip(frame ** (1.0 / 2.2), 0.0, 1.0).astype(np.float32)
+        # Apply the chosen HDR-to-display transfer function -> [0, 1]
+        frame = _encode_linear_to_display(frame, encoding=hdr_encoding, log2_max_val=log2_max_val)
 
         # [H, W, C] -> [C, H, W]
         frames.append(torch.from_numpy(frame).permute(2, 0, 1))
@@ -171,6 +260,8 @@ class MediaDataset(Dataset):
         resolution_buckets: list[tuple[int, int, int]],
         reshape_mode: str = "center",
         with_audio: bool = False,
+        hdr_encoding: HdrEncoding = DEFAULT_HDR_ENCODING,
+        log2_max_val: float = DEFAULT_LOG2_MAX_VAL,
     ) -> None:
         """
         Initialize the media dataset.
@@ -180,6 +271,10 @@ class MediaDataset(Dataset):
             resolution_buckets: List of (frames, height, width) tuples
             reshape_mode: How to crop videos ("center", "random")
             with_audio: Whether to extract audio from video files
+            hdr_encoding: Transfer function for EXR sequences. Use "log2" to preserve HDR
+                information for HDR training. "gamma22" (default) gives SDR-equivalent output.
+            log2_max_val: Maximum scene-linear value assumed by "log2" and "linear_normalized"
+                encodings. Ignored for "gamma22", "pq", and "hlg".
         """
         super().__init__()
 
@@ -188,6 +283,8 @@ class MediaDataset(Dataset):
         self.resolution_buckets = resolution_buckets
         self.reshape_mode = reshape_mode
         self.with_audio = with_audio
+        self.hdr_encoding = hdr_encoding
+        self.log2_max_val = log2_max_val
 
         # First load main media paths
         self.main_media_paths = self._load_video_paths(main_media_column)
@@ -444,7 +541,12 @@ class MediaDataset(Dataset):
 
     def _preprocess_exr_sequence(self, path: Path) -> tuple[torch.Tensor, float]:
         """Preprocess an EXR frame sequence using the same pipeline as regular video."""
-        video, fps = _load_exr_sequence(path, max_frames=self.max_target_frames)
+        video, fps = _load_exr_sequence(
+            path,
+            max_frames=self.max_target_frames,
+            hdr_encoding=self.hdr_encoding,
+            log2_max_val=self.log2_max_val,
+        )
         # video is [F, C, H, W] — same shape as what read_video returns
 
         nearest_bucket = self._get_resolution_bucket_for_item(video)
@@ -550,6 +652,8 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     vae_tiling: bool = False,
     with_audio: bool = False,
     audio_output_dir: str | None = None,
+    hdr_encoding: HdrEncoding = DEFAULT_HDR_ENCODING,
+    log2_max_val: float = DEFAULT_LOG2_MAX_VAL,
 ) -> None:
     """
     Process videos and save latent representations.
@@ -566,6 +670,9 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         vae_tiling: Whether to enable VAE tiling
         with_audio: Whether to extract and encode audio from videos
         audio_output_dir: Directory to save audio latents (required if with_audio=True)
+        hdr_encoding: Transfer function for EXR sequences. "gamma22" (default) gives SDR
+            output; "log2" preserves HDR information for HDR training.
+        log2_max_val: Max scene-linear value for "log2" / "linear_normalized" encodings.
     """
     # Validate audio parameters
     if with_audio and audio_output_dir is None:
@@ -582,6 +689,8 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         resolution_buckets=resolution_buckets,
         reshape_mode=reshape_mode,
         with_audio=with_audio,
+        hdr_encoding=hdr_encoding,
+        log2_max_val=log2_max_val,
     )
     logger.info(f"Loaded {len(dataset)} valid media files")
 
@@ -1064,6 +1173,11 @@ def main(  # noqa: PLR0913
         default="media_path",
         help="Column name in the dataset JSON/JSONL/CSV file containing video paths",
     ),
+    main_media_column: str | None = typer.Option(
+        default=None,
+        help="Column used to derive the output latent filename. Defaults to --video-column. "
+        "Set to 'media_path' when encoding reference videos so latent filenames match the target.",
+    ),
     batch_size: int = typer.Option(
         default=1,
         help="Batch size for processing",
@@ -1088,6 +1202,24 @@ def main(  # noqa: PLR0913
         default=None,
         help="Output directory for audio latents (required if --with-audio is set)",
     ),
+    hdr_encoding: HdrEncoding = typer.Option(
+        default=DEFAULT_HDR_ENCODING,
+        help=(
+            "Transfer function applied to scene-linear EXR frames before VAE encoding. "
+            "'gamma22' (default) produces SDR-equivalent output and is backward-compatible. "
+            "'log2' preserves HDR information for HDR training (recommended for SDR→HDR). "
+            "'pq' uses the ST 2084 (HDR10) curve. 'hlg' uses Hybrid Log-Gamma. "
+            "'linear_normalized' divides by --log2-max-val and clips."
+        ),
+    ),
+    log2_max_val: float = typer.Option(
+        default=DEFAULT_LOG2_MAX_VAL,
+        help=(
+            "Maximum scene-linear value assumed when --hdr-encoding is 'log2' or "
+            "'linear_normalized'. Values above this are clipped. For S2R-HDR rendered "
+            "sequences, 100.0 covers virtually all pixels."
+        ),
+    ),
 ) -> None:
     """Process videos/images and save latent representations for video generation training.
     This script processes videos and images from metadata files and saves latent representations
@@ -1103,6 +1235,10 @@ def main(  # noqa: PLR0913
         # Enable VAE tiling to save GPU VRAM
         python scripts/process_videos.py dataset.csv --resolution-buckets 1024x1024x25 \\
             --output-dir ./latents --model-path /path/to/ltx2.safetensors --vae-tiling
+        # Process EXR sequences with log2 HDR encoding (for HDR training targets)
+        python scripts/process_videos.py dataset.json --resolution-buckets 768x768x25 \\
+            --output-dir ./latents --model-path /path/to/ltx2.safetensors \\
+            --hdr-encoding log2 --log2-max-val 100
         # Process videos with audio
         python scripts/process_videos.py dataset.csv --resolution-buckets 768x768x25 \\
             --output-dir ./latents --model-path /path/to/ltx2.safetensors \\
@@ -1130,6 +1266,7 @@ def main(  # noqa: PLR0913
     compute_latents(
         dataset_file=dataset_file,
         video_column=video_column,
+        main_media_column=main_media_column,
         resolution_buckets=parsed_resolution_buckets,
         output_dir=output_dir,
         model_path=model_path,
@@ -1139,7 +1276,61 @@ def main(  # noqa: PLR0913
         vae_tiling=vae_tiling,
         with_audio=with_audio,
         audio_output_dir=audio_output_dir,
+        hdr_encoding=hdr_encoding,
+        log2_max_val=log2_max_val,
     )
+
+
+@app.command()
+def generate_dataset(
+    data_dir: Path = typer.Argument(  # noqa: B008
+        ...,
+        help="S2R-HDR processed-patch directory (e.g. data/S2R-HDR-processed-patch)",
+        exists=True,
+    ),
+    output: Path = typer.Option(  # noqa: B008
+        ...,
+        "--output",
+        "-o",
+        help="Path to the output JSON dataset file",
+    ),
+    caption: str = typer.Option(
+        "A high dynamic range video clip.",
+        "--caption",
+        help="Caption text assigned to every sample",
+    ),
+) -> None:
+    """Generate a dataset JSON from an S2R-HDR processed-patch directory.
+
+    Scans data_dir for subdirectories that contain an img/ EXR sequence and
+    writes a JSON file with one entry per patch.  Paths in the JSON are
+    relative to data_dir so the file can be used directly with
+    `process_videos.py main` and `compute_reference.py`.
+
+    Example:
+        process_videos.py generate-dataset data/S2R-HDR-processed-patch \\
+            --output data/s2r_hdr_dataset.json
+    """
+    console = Console()
+    entries = []
+    for scene_dir in sorted(data_dir.iterdir()):
+        if not scene_dir.is_dir() or scene_dir.name.startswith("."):
+            continue
+        img_dir = scene_dir / "img"
+        if not img_dir.is_dir() or not any(img_dir.glob("*.exr")):
+            continue
+        entries.append(
+            {
+                "media_path": str(img_dir.relative_to(data_dir)),
+                "caption": caption,
+            }
+        )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8") as f:
+        json.dump(entries, f, indent=2, ensure_ascii=False)
+
+    console.print(f"[bold green]✓[/] Wrote [bold]{len(entries)}[/] entries to [cyan]{output}[/]")
 
 
 if __name__ == "__main__":

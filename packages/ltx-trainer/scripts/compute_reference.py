@@ -15,9 +15,17 @@ from typing import Dict
 
 # Third-party imports
 import cv2
+import numpy as np
 import torch
 import torchvision.transforms.functional as TF  # noqa: N812
 import typer
+
+try:
+    import OpenImageIO as oiio
+
+    HAS_OIIO = True
+except ImportError:
+    HAS_OIIO = False
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -36,6 +44,66 @@ from ltx_trainer.video_utils import read_video, save_video
 # Initialize console and disable progress bars
 console = Console()
 disable_progress_bar()
+
+
+def _is_exr_sequence_dir(path: Path) -> bool:
+    """Return True if path is a directory containing .exr files."""
+    return path.is_dir() and any(path.glob("*.exr"))
+
+
+def _load_exr_sequence_as_sdr(path: Path) -> tuple[torch.Tensor, float]:
+    """Load an EXR frame sequence and tone-map to SDR via gamma-2.2.
+
+    Expects scene-linear values already in [0, 1] (as produced by the
+    S2R-HDR preprocessing step).  Applies out = linear^(1/2.2) and
+    returns a float tensor in [0, 1].
+
+    Args:
+        path: Directory containing sequentially-named .exr files.
+
+    Returns:
+        Tuple of (tensor [F, 3, H, W] float32 in [0, 1], fps).
+    """
+    if not HAS_OIIO:
+        raise ImportError("EXR support requires OpenImageIO: pip install openimageio")
+
+    exr_files = sorted(path.glob("*.exr"))
+    if not exr_files:
+        raise ValueError(f"No .exr files found in {path}")
+
+    fps = 24.0
+    fps_file = path / "fps.txt"
+    if fps_file.exists():
+        try:
+            fps = float(fps_file.read_text().strip())
+        except ValueError:
+            pass
+
+    frames = []
+    for exr_path in exr_files:
+        inp = oiio.ImageInput.open(str(exr_path))
+        if inp is None:
+            raise ValueError(f"OpenImageIO could not open {exr_path}: {oiio.geterror()}")
+        spec = inp.spec()
+        pixels = inp.read_image(oiio.FLOAT)  # [H, W, nchannels] float32
+        inp.close()
+
+        if pixels is None:
+            raise ValueError(f"Failed to read pixel data from {exr_path}")
+
+        channel_names = [spec.channelnames[i] for i in range(spec.nchannels)]
+        r_idx = channel_names.index("R")
+        g_idx = channel_names.index("G")
+        b_idx = channel_names.index("B")
+        frame = pixels[:, :, [r_idx, g_idx, b_idx]]  # [H, W, 3]
+
+        # Gamma-2.2 tone-map: linear [0,1] -> display [0,1]
+        frame = np.clip(frame, 0.0, 1.0)
+        frame = np.power(frame, 1.0 / 2.2).astype(np.float32)
+
+        frames.append(torch.from_numpy(frame).permute(2, 0, 1))  # [3, H, W]
+
+    return torch.stack(frames, dim=0), fps  # [F, 3, H, W]
 
 
 def compute_reference(
@@ -156,6 +224,10 @@ def process_media(
     skipped_media = []
 
     def media_path_to_reference_path(media_file: Path) -> Path:
+        # EXR sequence directories have no file extension; save their SDR
+        # reference as an MP4 alongside the directory.
+        if not media_file.suffix:
+            return media_file.parent / (media_file.stem + "_sdr.mp4")
         return media_file.parent / (media_file.stem + "_reference" + media_file.suffix)
 
     media_files = [base_dir / Path(sample["media_path"]) for sample in meta_data]
@@ -193,20 +265,18 @@ def process_media(
 
             if not reference_path.resolve().exists() or override:
                 try:
-                    video, fps = read_video(media_file)
+                    if _is_exr_sequence_dir(media_file):
+                        # S2R-HDR path: generate SDR reference via gamma-2.2 tone-mapping
+                        all_condition, fps = _load_exr_sequence_as_sdr(media_file)
+                    else:
+                        # Default path: Canny edge detection on regular video
+                        video, fps = read_video(media_file)
+                        condition_frames = []
+                        for i in range(0, len(video), batch_size):
+                            batch = video[i : i + batch_size]
+                            condition_frames.append(compute_reference(batch))
+                        all_condition = torch.cat(condition_frames, dim=0)
 
-                    # Process frames in batches
-                    condition_frames = []
-
-                    for i in range(0, len(video), batch_size):
-                        batch = video[i : i + batch_size]
-                        condition_batch = compute_reference(batch)
-                        condition_frames.append(condition_batch)
-
-                    # Concatenate all edge frames
-                    all_condition = torch.cat(condition_frames, dim=0)
-
-                    # Save the edge video
                     save_video(all_condition, reference_path.resolve(), fps=fps)
 
                 except Exception as e:
